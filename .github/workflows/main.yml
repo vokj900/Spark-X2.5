@@ -29,6 +29,7 @@ jobs:
       contents: write
 
     steps:
+      # 0. 安装 CUDA Toolkit
       - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
@@ -36,6 +37,7 @@ jobs:
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
 
+      # 1. 拉取 XHToken/llama.cpp（含 spark2_5 架构支持）
       - name: Checkout XHToken/llama.cpp
         uses: actions/checkout@v4
         with:
@@ -43,7 +45,8 @@ jobs:
           ref: master
           submodules: recursive
 
-      - name: Build llama-server for RTX 5060 Ti (sm_120)
+      # 2. 编译（单会话）
+      - name: Build llama-server
         shell: cmd
         run: |
           echo ================================================================
@@ -110,39 +113,66 @@ jobs:
           echo ✅ CMake 配置完成
 
           echo ================================================================
-          echo [5/5] 编译 llama-server
+          echo [5/5] 编译（先尝试 llama-server target，失败则编 all）
           echo ================================================================
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% -t llama-server
-          if %ERRORLEVEL% neq 0 (echo ❌ 编译失败 && exit /b 1)
-          echo 🎉🎉🎉 编译成功！
 
+          cmake --build build --config Release -j %NINJA_JOBS% -t llama-server 2>nul
+          if exist "build\bin\Release\llama-server.exe" (
+            echo ✅ llama-server target 编译成功
+          ) else (
+            echo ⚠️ llama-server target 不存在，改用 all target 编译全部
+            cmake --build build --config Release -j %NINJA_JOBS%
+            if %ERRORLEVEL% neq 0 (echo ❌ 编译失败 && exit /b 1)
+          )
+
+          if not exist "build\bin\Release\llama-server.exe" if not exist "build\bin\llama-server.exe" (
+            echo ❌ 未找到 llama-server.exe，编译异常
+            exit /b 1
+          )
+          echo 🎉🎉🎉 编译完成！
+
+      # 3. 收集产物（递归查找，兼容不同目录布局）
       - name: Collect artifacts
-        shell: cmd
-        run: |
-          mkdir out
-          copy build\bin\Release\llama-server.exe out\
-          copy build\bin\Release\ggml*.dll out\
-          copy build\bin\Release\llama*.dll out\
-          copy "%CUDA_PATH%\bin\cudart64_*.dll" out\
-          copy "%CUDA_PATH%\bin\cublas64_*.dll" out\
-          copy "%CUDA_PATH%\bin\cublasLt64_*.dll" out\
-          echo === 产物列表 ===
-          dir out\
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: spark-x25-server-rtx5060ti
-          path: out\
-
-      - name: Download and release
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release-files
-          Move-Item out\* release-files\ -Force
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+
+          # 找 llama-server.exe
+          $server = Get-ChildItem -Path build -Recurse -Filter "llama-server.exe" | Select-Object -First 1
+          if ($server) {
+            Copy-Item $server.FullName -Destination out\
+            echo "✅ 找到 llama-server.exe: $($server.FullName)"
+          } else {
+            echo "❌ 未找到 llama-server.exe"
+            exit 1
+          }
+
+          # 收集 dll（递归）
+          $dlls = Get-ChildItem -Path build -Recurse -Include @("ggml*.dll","llama*.dll","mtmd.dll")
+          foreach ($dll in $dlls) {
+            Copy-Item $dll.FullName -Destination out\ -Force
+          }
+
+          # CUDA 运行库
+          $cudaBin = "$env:CUDA_PATH\bin"
+          $cudaDlls = @("cudart64_*.dll","cublas64_*.dll","cublasLt64_*.dll")
+          foreach ($pattern in $cudaDlls) {
+            $files = Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
+            foreach ($f in $files) {
+              Copy-Item $f.FullName -Destination out\ -Force
+            }
+          }
+
+          echo "=== 产物列表 ==="
+          Get-ChildItem out\ | Format-Table Name, Length
+
+      # 4. 打包并发布
+      - name: Package and release
+        shell: pwsh
+        run: |
           $zipName = "spark-x25-llama-server-cuda${{ inputs.cuda_version }}-rtx5060ti-${{ inputs.tag_name }}.zip"
-          Compress-Archive -Path release-files\* -DestinationPath $zipName
+          Compress-Archive -Path out\* -DestinationPath $zipName -Force
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Create GitHub Release
