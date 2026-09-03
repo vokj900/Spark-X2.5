@@ -1,15 +1,15 @@
-name: Build Spark-X2.5 llama-server for RTX 5060 Ti (Windows)
+name: Build Spark-X2.5 Server for RTX 5060 Ti (Windows)
 
 on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release 版本号'
+        description: 'Release 版本号（如 v1.0.0）'
         required: true
         default: 'v1.0.0'
         type: string
       cuda_version:
-        description: 'CUDA 版本'
+        description: 'CUDA 版本（如 12.8.1）'
         required: false
         default: '12.8.1'
         type: string
@@ -38,19 +38,20 @@ jobs:
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
 
       # 1. 拉取 XHToken/llama.cpp（含 spark2_5 架构支持）
-      - name: Checkout XHToken/llama.cpp
+      - name: Checkout XHToken/llama.cpp (master)
         uses: actions/checkout@v4
         with:
           repository: XHToken/llama.cpp
           ref: master
           submodules: recursive
+          path: src
 
-      # 2. 编译（单会话）
-      - name: Build llama-server
+      # 2. 编译（同会话：MSVC + 屏蔽MinGW + CMake + Build）
+      - name: Build llama-server (Windows + CUDA + sm_120)
         shell: cmd
         run: |
           echo ================================================================
-          echo [1/5] 加载 MSVC x64 环境
+          echo [1/6] 加载 MSVC x64 环境
           echo ================================================================
           for /f "delims=" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set "VS_PATH=%%i"
           set "VCVARS=%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
@@ -62,7 +63,7 @@ jobs:
           echo ✅ MSVC cl.exe: %CL_PATH%
 
           echo ================================================================
-          echo [2/5] 屏蔽 MinGW
+          echo [2/6] 从 PATH 中剔除预装 MinGW
           echo ================================================================
           set "PATH=%PATH:C:\mingw64\bin;=%"
           set "PATH=%PATH:;C:\mingw64\bin=%"
@@ -73,28 +74,38 @@ jobs:
           set "PATH=%PATH:C:\msys64\ucrt64\bin;=%"
           set "PATH=%PATH:;C:\msys64\ucrt64\bin=%"
           set "PATH=%PATH:C:\msys64\ucrt64\bin=%"
+          where cc.exe && (
+            for %%i in (cc.exe gcc.exe g++.exe) do (
+              for /f "delims=" %%j in ('where %%i 2^>nul') do del /f /q "%%j" || echo 删除 %%j 失败
+            )
+          ) || echo ✅ cc.exe 已在 PATH 中消失
           where cc.exe && (echo ❌ cc.exe 仍存在 && exit /b 1) || echo ✅ MinGW 屏蔽成功
 
           echo ================================================================
-          echo [3/5] 安装依赖
+          echo [3/6] 安装依赖 + 验证 CUDA
           echo ================================================================
           echo CUDA_PATH: %CUDA_PATH%
           set "CUDA_BIN=%CUDA_PATH%\bin"
           if not exist "%CUDA_BIN%\nvcc.exe" (
-            echo ❌ nvcc.exe 不存在！
+            echo ❌ %CUDA_BIN%\nvcc.exe 不存在！
+            dir "%CUDA_BIN%"
             exit /b 1
           )
-          echo CUDA bin 目录：%CUDA_BIN%
+          echo ✅ CUDA bin 目录：%CUDA_BIN%
           set "PATH=%CUDA_BIN%;%PATH%"
 
-          choco install ninja -y --no-progress
+          choco install openssl ninja -y --no-progress
           where ninja || (echo ❌ ninja 未安装 && exit /b 1)
+          where nvcc || (echo ❌ nvcc 仍未找到 && exit /b 1)
           nvcc --version
           echo ✅ 依赖就绪
 
           echo ================================================================
-          echo [4/5] CMake 配置（RTX 5060 Ti: sm_120 + CUDA 12.8）
+          echo [4/6] CMake 配置（强制使用 MSVC，Blackwell sm_120）
           echo ================================================================
+          cd src
+          if exist build rmdir /s /q build
+          mkdir build
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DCMAKE_C_COMPILER="%CL_PATH%" ^
             -DCMAKE_CXX_COMPILER="%CL_PATH%" ^
@@ -105,82 +116,103 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="120" ^
             -DGGML_NATIVE=OFF ^
             -DLLAMA_BUILD_SERVER=ON ^
-            -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_TOOLS=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_BORINGSSL=OFF ^
+            -DOPENSSL_USE_STATIC_LIBS=ON ^
+            -DOPENSSL_ROOT_DIR="C:\Program Files\OpenSSL" ^
             -DCMAKE_C_FLAGS="/MT" ^
-            -DCMAKE_CXX_FLAGS="/MT"
+            -DCMAKE_CXX_FLAGS="/MT" ^
+            -DCMAKE_VERBOSE_MAKEFILE=ON
           if %ERRORLEVEL% neq 0 (echo ❌ CMake 配置失败 && exit /b 1)
           echo ✅ CMake 配置完成
 
           echo ================================================================
-          echo [5/5] 编译（先尝试 llama-server target，失败则编 all）
+          echo [5/6] 编译全部（all target，确保包含 llama-server）
           echo ================================================================
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+          if %ERRORLEVEL% neq 0 (echo ❌ 编译失败 && exit /b 1)
 
-          cmake --build build --config Release -j %NINJA_JOBS% -t llama-server 2>nul
-          if exist "build\bin\Release\llama-server.exe" (
-            echo ✅ llama-server target 编译成功
-          ) else (
-            echo ⚠️ llama-server target 不存在，改用 all target 编译全部
-            cmake --build build --config Release -j %NINJA_JOBS%
-            if %ERRORLEVEL% neq 0 (echo ❌ 编译失败 && exit /b 1)
-          )
+          REM 定位 llama-server.exe，兼容不同输出目录
+          if exist "build\bin\Release\llama-server.exe" goto :collect
+          if exist "build\bin\llama-server.exe" goto :collect
+          where /r build llama-server.exe >nul 2>&1 && goto :collect
+          echo ❌ 编译完成但未找到 llama-server.exe
+          dir /s build\*.exe
+          exit /b 1
 
-          if not exist "build\bin\Release\llama-server.exe" if not exist "build\bin\llama-server.exe" (
-            echo ❌ 未找到 llama-server.exe，编译异常
-            exit /b 1
-          )
-          echo 🎉🎉🎉 编译完成！
+          :collect
+          echo 🎉🎉🎉 编译成功！
 
-      # 3. 收集产物（递归查找，兼容不同目录布局）
-      - name: Collect artifacts
+          echo ================================================================
+          echo [6/6] 收集产物到 out 目录
+          echo ================================================================
+          mkdir out
+          for /f "delims=" %%f in ('where /r build llama-server.exe') do copy "%%f" out\
+          for /f "delims=" %%f in ('where /r build *.dll') do copy "%%f" out\ >nul 2>&1
+          copy "%CUDA_PATH%\bin\cudart64_*.dll" out\
+          copy "%CUDA_PATH%\bin\cublas64_*.dll" out\
+          copy "%CUDA_PATH%\bin\cublasLt64_*.dll" out\
+          copy "C:\Windows\System32\vcruntime140.dll" out\
+          copy "C:\Windows\System32\vcruntime140_1.dll" out\
+          copy "C:\Windows\System32\msvcp140.dll" out\
+          copy "C:\Windows\System32\msvcp140_1.dll" out\
+          copy "C:\Windows\System32\msvcp140_2.dll" out\
+          copy "C:\Windows\System32\concrt140.dll" out\
+          echo === 产物列表 ===
+          dir out\
+
+      # 3. 上传 artifact 中转
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-x25-server
+          path: src/out/
+          retention-days: 7
+
+      # 4. 下载并打包发布
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: spark-x25-server
+          path: release-files
+
+      - name: Package release zip
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path out | Out-Null
+          echo "=== 准备打包的文件 ==="
+          Get-ChildItem -Path "release-files" -Recurse | Format-Table FullName, Length
 
-          # 找 llama-server.exe
-          $server = Get-ChildItem -Path build -Recurse -Filter "llama-server.exe" | Select-Object -First 1
-          if ($server) {
-            Copy-Item $server.FullName -Destination out\
-            echo "✅ 找到 llama-server.exe: $($server.FullName)"
-          } else {
-            echo "❌ 未找到 llama-server.exe"
-            exit 1
-          }
-
-          # 收集 dll（递归）
-          $dlls = Get-ChildItem -Path build -Recurse -Include @("ggml*.dll","llama*.dll","mtmd.dll")
-          foreach ($dll in $dlls) {
-            Copy-Item $dll.FullName -Destination out\ -Force
-          }
-
-          # CUDA 运行库
-          $cudaBin = "$env:CUDA_PATH\bin"
-          $cudaDlls = @("cudart64_*.dll","cublas64_*.dll","cublasLt64_*.dll")
-          foreach ($pattern in $cudaDlls) {
-            $files = Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
-            foreach ($f in $files) {
-              Copy-Item $f.FullName -Destination out\ -Force
-            }
-          }
-
-          echo "=== 产物列表 ==="
-          Get-ChildItem out\ | Format-Table Name, Length
-
-      # 4. 打包并发布
-      - name: Package and release
-        shell: pwsh
-        run: |
           $zipName = "spark-x25-llama-server-cuda${{ inputs.cuda_version }}-rtx5060ti-${{ inputs.tag_name }}.zip"
-          Compress-Archive -Path out\* -DestinationPath $zipName -Force
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          Compress-Archive -Path "release-files\*" -DestinationPath $zipName -Force
+
+          echo "=== 最终 zip 文件 ==="
+          Get-Item $zipName | Format-List Name, Length
+          echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag_name }}
-          name: Spark-X2.5 llama-server ${{ inputs.tag_name }} — RTX 5060 Ti Windows CUDA
-          files: |
-            ${{ env.ZIP_NAME }}
-            out/llama-server.exe
-            out/*.dll
+          name: Spark-X2.5 Server ${{ inputs.tag_name }} — Windows RTX 5060 Ti
+          body: |
+            ## ✨ Spark-X2.5 Windows 版（RTX 5060 Ti / Blackwell sm_120）
+            基于 [XHToken/llama.cpp](https://github.com/XHToken/llama.cpp) 的 `master` 分支自动编译，支持 `spark2_5` 架构。
+
+            ### ✨ 核心特性
+            - **CUDA 12.8 + sm_120**：Blackwell 架构原生编译，RTX 5060 Ti 原生支持
+            - **Windows 原生**：无需 WSL，直接调用显卡驱动
+            - **开箱即用**：内置所有依赖 DLL，解压即跑
+            - **1M 上下文**：Spark-X2.5 原生支持超长上下文
+
+            ### 💻 显存适配（RTX 5060 Ti 16G）
+            | 精度 | 上下文 | 说明 |
+            |---|---|---|
+            | BF16 | 8K | 最稳，推荐 |
+            | Q8_0 | 32K+ | 长文本首选 |
+            | Q4_K_M | 65K+ | 极限上下文 |
+
+            ### 🚀 快速使用
+            1. 下载下方 zip 解压到纯英文目录
+            2. 放入 `Spark-X2.5-4B.gguf`
+            3. PowerShell 运行：
