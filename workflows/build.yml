@@ -1,0 +1,156 @@
+name: Build Spark-X2.5 llama-server for RTX 5060 Ti (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release 版本号'
+        required: true
+        default: 'v1.0.0'
+        type: string
+      cuda_version:
+        description: 'CUDA 版本'
+        required: false
+        default: '12.8.1'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ inputs.cuda_version }}
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+
+      - name: Checkout XHToken/llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: XHToken/llama.cpp
+          ref: master
+          submodules: recursive
+
+      - name: Build llama-server for RTX 5060 Ti (sm_120)
+        shell: cmd
+        run: |
+          echo ================================================================
+          echo [1/5] 加载 MSVC x64 环境
+          echo ================================================================
+          for /f "delims=" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set "VS_PATH=%%i"
+          set "VCVARS=%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist "%VCVARS%" (echo ❌ 未找到 %VCVARS% && exit /b 1)
+          call "%VCVARS%"
+          if %ERRORLEVEL% neq 0 (echo ❌ MSVC 环境加载失败 && exit /b 1)
+          where cl.exe || (echo ❌ cl.exe 未加载 && exit /b 1)
+          for /f "delims=" %%i in ('where cl.exe') do set "CL_PATH=%%i"
+          echo ✅ MSVC cl.exe: %CL_PATH%
+
+          echo ================================================================
+          echo [2/5] 屏蔽 MinGW
+          echo ================================================================
+          set "PATH=%PATH:C:\mingw64\bin;=%"
+          set "PATH=%PATH:;C:\mingw64\bin=%"
+          set "PATH=%PATH:C:\mingw64\bin=%"
+          set "PATH=%PATH:C:\msys64\mingw64\bin;=%"
+          set "PATH=%PATH:;C:\msys64\mingw64\bin=%"
+          set "PATH=%PATH:C:\msys64\mingw64\bin=%"
+          set "PATH=%PATH:C:\msys64\ucrt64\bin;=%"
+          set "PATH=%PATH:;C:\msys64\ucrt64\bin=%"
+          set "PATH=%PATH:C:\msys64\ucrt64\bin=%"
+          where cc.exe && (echo ❌ cc.exe 仍存在 && exit /b 1) || echo ✅ MinGW 屏蔽成功
+
+          echo ================================================================
+          echo [3/5] 安装依赖
+          echo ================================================================
+          echo CUDA_PATH: %CUDA_PATH%
+          set "CUDA_BIN=%CUDA_PATH%\bin"
+          if not exist "%CUDA_BIN%\nvcc.exe" (
+            echo ❌ nvcc.exe 不存在！
+            exit /b 1
+          )
+          echo CUDA bin 目录：%CUDA_BIN%
+          set "PATH=%CUDA_BIN%;%PATH%"
+
+          choco install ninja -y --no-progress
+          where ninja || (echo ❌ ninja 未安装 && exit /b 1)
+          nvcc --version
+          echo ✅ 依赖就绪
+
+          echo ================================================================
+          echo [4/5] CMake 配置（RTX 5060 Ti: sm_120 + CUDA 12.8）
+          echo ================================================================
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_C_COMPILER="%CL_PATH%" ^
+            -DCMAKE_CXX_COMPILER="%CL_PATH%" ^
+            -DCMAKE_CUDA_COMPILER="%CUDA_BIN%\nvcc.exe" ^
+            -DCMAKE_C_COMPILER_WORKS=ON ^
+            -DCMAKE_CXX_COMPILER_WORKS=ON ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="120" ^
+            -DGGML_NATIVE=OFF ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=OFF ^
+            -DCMAKE_C_FLAGS="/MT" ^
+            -DCMAKE_CXX_FLAGS="/MT"
+          if %ERRORLEVEL% neq 0 (echo ❌ CMake 配置失败 && exit /b 1)
+          echo ✅ CMake 配置完成
+
+          echo ================================================================
+          echo [5/5] 编译 llama-server
+          echo ================================================================
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% -t llama-server
+          if %ERRORLEVEL% neq 0 (echo ❌ 编译失败 && exit /b 1)
+          echo 🎉🎉🎉 编译成功！
+
+      - name: Collect artifacts
+        shell: cmd
+        run: |
+          mkdir out
+          copy build\bin\Release\llama-server.exe out\
+          copy build\bin\Release\ggml*.dll out\
+          copy build\bin\Release\llama*.dll out\
+          copy "%CUDA_PATH%\bin\cudart64_*.dll" out\
+          copy "%CUDA_PATH%\bin\cublas64_*.dll" out\
+          copy "%CUDA_PATH%\bin\cublasLt64_*.dll" out\
+          echo === 产物列表 ===
+          dir out\
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-x25-server-rtx5060ti
+          path: out\
+
+      - name: Download and release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-files
+          Move-Item out\* release-files\ -Force
+          $zipName = "spark-x25-llama-server-cuda${{ inputs.cuda_version }}-rtx5060ti-${{ inputs.tag_name }}.zip"
+          Compress-Archive -Path release-files\* -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: Spark-X2.5 llama-server ${{ inputs.tag_name }} — RTX 5060 Ti Windows CUDA
+          files: |
+            ${{ env.ZIP_NAME }}
+            out/llama-server.exe
+            out/*.dll
