@@ -29,7 +29,6 @@ jobs:
       contents: write
 
     steps:
-      # 0. 安装 CUDA Toolkit
       - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
@@ -37,7 +36,6 @@ jobs:
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
 
-      # 1. 拉取 XHToken/llama.cpp（含 spark2_5 架构支持）
       - name: Checkout XHToken/llama.cpp (master)
         uses: actions/checkout@v4
         with:
@@ -46,7 +44,6 @@ jobs:
           submodules: recursive
           path: src
 
-      # 2. 编译（同会话：MSVC + 屏蔽MinGW + CMake + Build）
       - name: Build llama-server (Windows + CUDA + sm_120)
         shell: cmd
         run: |
@@ -76,7 +73,7 @@ jobs:
           set "PATH=%PATH:C:\msys64\ucrt64\bin=%"
           where cc.exe && (
             for %%i in (cc.exe gcc.exe g++.exe) do (
-              for /f "delims=" %%j in ('where %%i 2^>nul') do del /f /q "%%j" || echo 删除 %%j 失败
+              for /f "delims=" %%j in ('where %%i 2^>nul') do del /f /q "%%j" || echo 删除 %%j  failed
             )
           ) || echo ✅ cc.exe 已在 PATH 中消失
           where cc.exe && (echo ❌ cc.exe 仍存在 && exit /b 1) || echo ✅ MinGW 屏蔽成功
@@ -101,7 +98,7 @@ jobs:
           echo ✅ 依赖就绪
 
           echo ================================================================
-          echo [4/6] CMake 配置（强制使用 MSVC，Blackwell sm_120）
+          echo [4/6] CMake 配置（★ 显式开启 LLAMA_BUILD_SERVER）
           echo ================================================================
           cd src
           if exist build rmdir /s /q build
@@ -127,29 +124,24 @@ jobs:
           echo ✅ CMake 配置完成
 
           echo ================================================================
-          echo [5/6] 编译全部（all target，确保包含 llama-server）
+          echo [5/6] 编译 llama-server（★ 现在 target 一定会生成）
           echo ================================================================
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release -j %NINJA_JOBS% -t llama-server
           if %ERRORLEVEL% neq 0 (echo ❌ 编译失败 && exit /b 1)
-
-          REM 定位 llama-server.exe，兼容不同输出目录
-          if exist "build\bin\Release\llama-server.exe" goto :collect
-          if exist "build\bin\llama-server.exe" goto :collect
-          where /r build llama-server.exe >nul 2>&1 && goto :collect
-          echo ❌ 编译完成但未找到 llama-server.exe
-          dir /s build\*.exe
-          exit /b 1
-
-          :collect
+          if not exist "build\bin\Release\llama-server.exe" (
+            echo ❌ 未找到 build\bin\Release\llama-server.exe
+            dir /s build\llama-server.exe 2>nul || echo 全盘未找到
+            exit /b 1
+          )
           echo 🎉🎉🎉 编译成功！
 
           echo ================================================================
           echo [6/6] 收集产物到 out 目录
           echo ================================================================
           mkdir out
-          for /f "delims=" %%f in ('where /r build llama-server.exe') do copy "%%f" out\
-          for /f "delims=" %%f in ('where /r build *.dll') do copy "%%f" out\ >nul 2>&1
+          copy build\bin\Release\llama-server.exe out\
+          copy build\bin\Release\*.dll out\
           copy "%CUDA_PATH%\bin\cudart64_*.dll" out\
           copy "%CUDA_PATH%\bin\cublas64_*.dll" out\
           copy "%CUDA_PATH%\bin\cublasLt64_*.dll" out\
@@ -162,7 +154,6 @@ jobs:
           echo === 产物列表 ===
           dir out\
 
-      # 3. 上传 artifact 中转
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -170,7 +161,6 @@ jobs:
           path: src/out/
           retention-days: 7
 
-      # 4. 下载并打包发布
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -182,10 +172,8 @@ jobs:
         run: |
           echo "=== 准备打包的文件 ==="
           Get-ChildItem -Path "release-files" -Recurse | Format-Table FullName, Length
-
           $zipName = "spark-x25-llama-server-cuda${{ inputs.cuda_version }}-rtx5060ti-${{ inputs.tag_name }}.zip"
           Compress-Archive -Path "release-files\*" -DestinationPath $zipName -Force
-
           echo "=== 最终 zip 文件 ==="
           Get-Item $zipName | Format-List Name, Length
           echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
@@ -197,22 +185,8 @@ jobs:
           name: Spark-X2.5 Server ${{ inputs.tag_name }} — Windows RTX 5060 Ti
           body: |
             ## ✨ Spark-X2.5 Windows 版（RTX 5060 Ti / Blackwell sm_120）
-            基于 [XHToken/llama.cpp](https://github.com/XHToken/llama.cpp) 的 `master` 分支自动编译，支持 `spark2_5` 架构。
-
-            ### ✨ 核心特性
-            - **CUDA 12.8 + sm_120**：Blackwell 架构原生编译，RTX 5060 Ti 原生支持
-            - **Windows 原生**：无需 WSL，直接调用显卡驱动
-            - **开箱即用**：内置所有依赖 DLL，解压即跑
-            - **1M 上下文**：Spark-X2.5 原生支持超长上下文
-
-            ### 💻 显存适配（RTX 5060 Ti 16G）
-            | 精度 | 上下文 | 说明 |
-            |---|---|---|
-            | BF16 | 8K | 最稳，推荐 |
-            | Q8_0 | 32K+ | 长文本首选 |
-            | Q4_K_M | 65K+ | 极限上下文 |
+            基于 [XHToken/llama.cpp](https://github.com/XHToken/llama.cpp) `master` 分支编译，支持 `spark2_5` 架构。
 
             ### 🚀 快速使用
-            1. 下载下方 zip 解压到纯英文目录
-            2. 放入 `Spark-X2.5-4B.gguf`
-            3. PowerShell 运行：
+            1. 下载解压到纯英文目录，放入 `Spark-X2.5-4B.gguf`
+            2. PowerShell 运行：
